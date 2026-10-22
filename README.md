@@ -3,6 +3,9 @@
 Get root ADB access through the Station's cloud configuration, keep ADB active after reboot, and
 disable automatic firmware updates.
 
+**Credits: All ideas in this project were taken from [eQuasar](https://git.gay/iwakura/eQuasar).
+This is just a repack for my own convenience.**
+
 **Tested only on Station Mini 2, YNDX-00020, firmware `0.369.1.46.4778262943.20261013.299`.** Other
 models and builds are untested. The tested `.50` build rejects the CA chain used here.
 
