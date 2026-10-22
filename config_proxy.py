@@ -5,22 +5,15 @@ import os
 import tempfile
 from datetime import UTC, datetime
 from decimal import Decimal
-from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from mitmproxy import ctx, exceptions, http
 
-from firmware_offer import FirmwareOffer
+from firmware_offer import NO_UPDATE, FirmwareOffer
 
 logger = logging.getLogger(__name__)
 HOSTS = frozenset(("quasar.yandex.net", "quasar.yandex.ru", "scbh.yandex.net"))
-
-
-class Mode(StrEnum):
-    OBSERVE = "observe"
-    ENABLE = "enable"
-    DISABLE = "disable"
 
 
 def exact_float(token: str) -> float:
@@ -30,9 +23,7 @@ def exact_float(token: str) -> float:
     return value
 
 
-def patch_config(content: bytes, mode: Mode) -> bytes:
-    if mode == Mode.OBSERVE:
-        return content
+def patch_config(content: bytes) -> bytes:
     payload = json.loads(content, parse_float=exact_float, parse_constant=exact_float)
     if not isinstance(payload, dict) or payload.get("status") != "ok":
         raise ValueError("Expected a successful configuration response")
@@ -45,10 +36,8 @@ def patch_config(content: bytes, mode: Mode) -> bytes:
     if "adbd" in system and not isinstance(system["adbd"], dict):
         raise TypeError("Expected an adbd object")
     adbd = system.setdefault("adbd", {})
-    adbd.update(remoteActivation=mode == Mode.ENABLE, network=mode == Mode.ENABLE)
-    if mode == Mode.DISABLE:
-        adbd["forceDisable"] = True
-    elif "forceDisable" in adbd:
+    adbd.update(remoteActivation=True, network=True)
+    if "forceDisable" in adbd:
         adbd["forceDisable"] = False
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
@@ -58,23 +47,11 @@ class StationConfig:
         self.offer = None
 
     def load(self, loader):
-        loader.add_option(
-            "station_mode", str, "observe", "observe, enable, or disable ADB"
-        )
         loader.add_option("station_target", str, "", "Selected Station's IPv4 address")
         loader.add_option("station_device_id", str, "", "Selected Station's device_id")
         loader.add_option("station_platform", str, "", "Selected Station's platform")
         loader.add_option(
             "station_state", str, "", "Private path for redacted result metadata"
-        )
-        loader.add_option(
-            "station_block_updates",
-            bool,
-            False,
-            "Report no update for selected Station checks",
-        )
-        loader.add_option(
-            "station_three_hosts", bool, False, "Route the three Station recovery hosts"
         )
         loader.add_option("station_offer_manifest", str, "", "Firmware manifest path")
         loader.add_option(
@@ -82,39 +59,7 @@ class StationConfig:
         )
 
     def configure(self, _updated):
-        try:
-            mode = Mode(ctx.options.station_mode)
-            if ctx.options.station_target:
-                ipaddress.IPv4Address(ctx.options.station_target)
-        except ValueError as error:
-            raise exceptions.OptionsError(
-                "Invalid station_mode or station_target"
-            ) from error
-        offer_paths = (
-            ctx.options.station_offer_manifest,
-            ctx.options.station_offer_receipt,
-        )
-        if bool(offer_paths[0]) != bool(offer_paths[1]):
-            raise exceptions.OptionsError(
-                "Firmware offer requires manifest and receipt"
-            )
-        if offer_paths[0] and ctx.options.station_block_updates:
-            raise exceptions.OptionsError("Choose firmware offer or block_updates")
-        if (
-            ctx.options.station_block_updates
-            or any(offer_paths)
-            or ctx.options.station_three_hosts
-        ) and not all(
-            (
-                ctx.options.station_target,
-                ctx.options.station_device_id,
-                ctx.options.station_platform,
-            )
-        ):
-            raise exceptions.OptionsError(
-                "Set station_target, station_device_id and station_platform before recovery"
-            )
-        if mode != Mode.OBSERVE and not all(
+        if not all(
             (
                 ctx.options.station_target,
                 ctx.options.station_device_id,
@@ -124,6 +69,18 @@ class StationConfig:
         ):
             raise exceptions.OptionsError(
                 "Set station_target, station_device_id, station_platform and station_state before changing ADB"
+            )
+        try:
+            ipaddress.IPv4Address(ctx.options.station_target)
+        except ValueError as error:
+            raise exceptions.OptionsError("Invalid station_target") from error
+        offer_paths = (
+            ctx.options.station_offer_manifest,
+            ctx.options.station_offer_receipt,
+        )
+        if bool(offer_paths[0]) != bool(offer_paths[1]):
+            raise exceptions.OptionsError(
+                "Firmware offer requires manifest and receipt"
             )
         try:
             self.offer = (
@@ -141,9 +98,7 @@ class StationConfig:
                 "Cannot load firmware manifest; check its platform, version and download URLs"
             ) from error
         logger.info(
-            "Station proxy configured: mode=%s, block_updates=%s, target=%s, offer=%s",
-            mode,
-            ctx.options.station_block_updates,
+            "Station proxy configured: target=%s, offer=%s",
             ctx.options.station_target,
             self.offer is not None,
         )
@@ -167,59 +122,67 @@ class StationConfig:
 
     def request(self, flow):
         request = flow.request
-        if ctx.options.station_three_hosts:
-            try:
-                authority = urlsplit("//" + (request.host_header or ""))
-                valid_authority = (
-                    authority.hostname in HOSTS
-                    and len(request.headers.get_all("Host")) == 1
-                    and authority.port
-                    in (None, 80 if request.scheme == "http" else 443)
-                    and not authority.username
-                    and not authority.password
-                    and not authority.path
-                    and not authority.query
-                    and not authority.fragment
-                    and (
-                        not flow.client_conn.sni
-                        or flow.client_conn.sni == authority.hostname
-                    )
+        try:
+            authority = urlsplit("//" + (request.host_header or ""))
+            valid_authority = (
+                authority.hostname in HOSTS
+                and len(request.headers.get_all("Host")) == 1
+                and authority.port in (None, 80 if request.scheme == "http" else 443)
+                and not authority.username
+                and not authority.password
+                and not authority.path
+                and not authority.query
+                and not authority.fragment
+                and (
+                    not flow.client_conn.sni
+                    or flow.client_conn.sni == authority.hostname
                 )
-            except ValueError:
-                valid_authority = False
-            if not valid_authority:
-                flow.response = http.Response.make(421, b"Unexpected authority")
-                return
-            # Reverse mode prepopulates the default upstream, not the original Host.
-            request.host = authority.hostname
-            path = urlsplit(request.path).path
-            if self.selected_source(flow) and path == "/generate_204":
-                flow.response = http.Response.make(
-                    204, b"", {"Cache-Control": "no-store"}
-                )
-                logger.info(
-                    "Selected Station connectivity check, host=%s status=204",
-                    request.host,
-                )
-                return
-            if request.scheme == "http":
-                flow.response = http.Response.make(
-                    307,
-                    b"",
-                    {
-                        "Location": "https://" + request.host + request.path,
-                        "Cache-Control": "no-store",
-                    },
-                )
-                return
-            request.port = 443
+            )
+        except ValueError:
+            valid_authority = False
+        if not valid_authority:
+            flow.response = http.Response.make(421, b"Unexpected authority")
+            return
+        # Reverse mode prepopulates the default upstream, not the original Host.
+        request.host = authority.hostname
+        path = urlsplit(request.path).path
+        if self.selected_source(flow) and path == "/generate_204":
+            flow.response = http.Response.make(204, b"", {"Cache-Control": "no-store"})
+            logger.info(
+                "Selected Station connectivity check, host=%s status=204",
+                request.host,
+            )
+            return
+        if (
+            self.offer is None
+            and self.selected_source(flow)
+            and path == "/check_updates"
+        ):
+            flow.response = http.Response.make(
+                200,
+                NO_UPDATE,
+                {"Content-Type": "application/json", "Cache-Control": "no-store"},
+            )
+            logger.info("Selected Station update check blocked, status=200")
+            return
+        if request.scheme == "http":
+            flow.response = http.Response.make(
+                307,
+                b"",
+                {
+                    "Location": "https://" + request.host + request.path,
+                    "Cache-Control": "no-store",
+                },
+            )
+            return
+        request.port = 443
         if (
             self.offer
             and self.selected_source(flow)
             and request.host in HOSTS
             and urlsplit(request.path).path == "/check_updates"
         ):
-            content, reason = b'{"hasUpdate":false}', "invalid_selectors"
+            content, reason = NO_UPDATE, "invalid_selectors"
             version = request.query.get("version", "")
             if (
                 self.selected_api(flow, "/check_updates")
@@ -251,25 +214,6 @@ class StationConfig:
                 shown_version,
             )
             return
-        if not ctx.options.station_block_updates or not self.selected_api(
-            flow, "/check_updates"
-        ):
-            return
-        flow.response = http.Response.make(
-            200,
-            b'{"hasUpdate":false}',
-            {"Content-Type": "application/json", "Cache-Control": "no-store"},
-        )
-        version = request.query.get("version", "")
-        if (
-            not version
-            or len(version) > 128
-            or any(character not in "0123456789." for character in version)
-        ):
-            version = "unavailable"
-        logger.info(
-            "Selected Station update check blocked, status=200, firmware=%s", version
-        )
 
     def response(self, flow):
         request = flow.request
@@ -289,19 +233,18 @@ class StationConfig:
             or flow.response.content is None
         ):
             return
-        mode = Mode(ctx.options.station_mode)
         before = flow.response.content
         try:
-            after = patch_config(before, mode)
+            after = patch_config(before)
         except (ValueError, TypeError):
             logger.warning(
                 "Selected Station configuration was not modified: unexpected JSON shape"
             )
             return
-        if ctx.options.station_state:
+        try:
             state = {
                 "at": datetime.now(UTC).isoformat(),
-                "mode": mode,
+                "mode": "enable",
                 "status": 200,
                 "modified": after != before,
             }
@@ -319,11 +262,18 @@ class StationConfig:
                 temporary.replace(path)
             finally:
                 temporary.unlink(missing_ok=True)
-        if mode != Mode.OBSERVE:
-            flow.response.content = after
-            for header in ("etag", "content-md5"):
-                flow.response.headers.pop(header, None)
-        logger.info("Selected Station configuration processed in %s mode", mode)
+        except OSError as error:
+            logger.error("Cannot write Station result metadata: %s", error)
+            flow.response = http.Response.make(
+                502,
+                b"Cannot record Station configuration result",
+                {"Cache-Control": "no-store"},
+            )
+            return
+        flow.response.content = after
+        for header in ("etag", "content-md5"):
+            flow.response.headers.pop(header, None)
+        logger.info("Selected Station configuration enabled ADB")
 
 
 addons = [StationConfig()]

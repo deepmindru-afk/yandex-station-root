@@ -2,12 +2,10 @@
 
 import argparse
 import copy
-import io
 import json
 import re
 import shlex
 import subprocess
-import tarfile
 import tempfile
 from pathlib import Path
 
@@ -224,14 +222,13 @@ done
 for f do
     [ -f "$f" ] && [ ! -L "$f" ] || {{ echo 'Expected regular native files' >&2; exit 1; }}
 done
-tar -cf - "$@"
+printf '%s\\n' "$@"
 """
 
 
-def adb_run(adb, serial, *args, content=None):
+def adb_run(adb, serial, *args):
     result = subprocess.run(
         [adb, "-s", serial, *args],
-        input=content,
         capture_output=True,
         timeout=60,
         check=False,
@@ -243,22 +240,42 @@ def adb_run(adb, serial, *args, content=None):
     return result.stdout
 
 
+def adb_shell(adb, serial, script):
+    command = (
+        f"sh -c {shlex.quote(script)}; station_root_status=$?; "
+        "printf '\\n__STATION_ROOT_STATUS__%s\\n' \"$station_root_status\""
+    )
+    output = adb_run(adb, serial, "shell", command)
+    completion = re.search(rb"\r?\n__STATION_ROOT_STATUS__([0-9]+)\r?\n\Z", output)
+    if completion is None:
+        raise ValueError("ADB shell did not report command completion")
+    content = output[: completion.start()].replace(b"\r\n", b"\n")
+    if int(completion[1]):
+        raise ValueError(
+            f"Station command failed ({int(completion[1])}): "
+            + content.decode(errors="replace").strip()
+        )
+    return content
+
+
+def adb_read(adb, serial, path):
+    with tempfile.TemporaryDirectory(prefix="station-root-") as local:
+        destination = Path(local) / "file"
+        adb_run(adb, serial, "pull", path, str(destination))
+        return destination.read_bytes()
+
+
 def read_snapshot(adb, serial):
-    archive = adb_run(adb, serial, "exec-out", "sh", "-c", SNAPSHOT)
+    names = adb_shell(adb, serial, SNAPSHOT).decode().splitlines()
     files = {}
-    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as source:
-        for member in source:
-            valid_name = member.name in (
-                "version_full",
-                ADB_SCRIPT,
-                LAUNCHER,
-            ) or re.fullmatch(
-                r"(?:activate_adb\.[A-Za-z0-9_.-]*original\.sh|launch\.[A-Za-z0-9_.-]*original\.json)",
-                member.name,
-            )
-            if not member.isfile() or not valid_name or member.name in files:
-                raise ValueError("Unexpected native file in ADB snapshot")
-            files[member.name] = source.extractfile(member).read()
+    for name in names:
+        valid_name = name in ("version_full", ADB_SCRIPT, LAUNCHER) or re.fullmatch(
+            r"(?:activate_adb\.[A-Za-z0-9_.-]*original\.sh|launch\.[A-Za-z0-9_.-]*original\.json)",
+            name,
+        )
+        if not valid_name or name in files:
+            raise ValueError("Unexpected native file in ADB snapshot")
+        files[name] = adb_read(adb, serial, f"{Q}/{name}")
     if not {"version_full", ADB_SCRIPT, LAUNCHER} <= files.keys():
         raise ValueError("Incomplete Station snapshot")
     return files
@@ -266,9 +283,7 @@ def read_snapshot(adb, serial):
 
 def apply_change(adb, serial, files, destination, replacement, backup, markers):
     stage = (
-        adb_run(
-            adb, serial, "shell", "mktemp", "-d", "/data/local/tmp/station-root.XXXXXX"
-        )
+        adb_shell(adb, serial, "mktemp -d /data/local/tmp/station-root.XXXXXX")
         .decode()
         .strip()
     )
@@ -282,10 +297,7 @@ def apply_change(adb, serial, files, destination, replacement, backup, markers):
                 (payload / name).write_bytes(content)
             (payload / "replacement").write_bytes(replacement)
             adb_run(adb, serial, "push", str(payload), stage)
-        if (
-            adb_run(adb, serial, "exec-out", "cat", stage + "/payload/replacement")
-            != replacement
-        ):
+        if adb_read(adb, serial, stage + "/payload/replacement") != replacement:
             raise ValueError("Replacement upload differs from prepared content")
         script = f"""set -eu
 q={Q}
@@ -296,6 +308,7 @@ remounted=false
 new=''
 cleanup() {{
     result=$?
+    trap '' HUP INT TERM
     trap - EXIT
     if [ -n "$new" ]; then rm -f "$new" || result=1; fi
     if [ "$remounted" = true ]; then sync || result=1; mount -o remount,ro / || result=1; fi
@@ -318,7 +331,7 @@ done
         if backup or replacement != files[destination]:
             script += """root_options=$(awk '$2 == "/" {print $4}' /proc/mounts)
 case ",$root_options," in
-    *,ro,*) mount -o remount,rw /; remounted=true ;;
+    *,ro,*) remounted=true; mount -o remount,rw / ;;
     *,rw,*) : ;;
     *) echo 'Cannot determine root mount mode' >&2; exit 1 ;;
 esac
@@ -346,13 +359,13 @@ sync
             script += """mkdir -p /data/quasar
 touch /data/quasar/activate_adb_quasmodrom /data/quasar/activate_network_adb
 """
-        adb_run(adb, serial, "shell", "sh", "-s", content=script.encode())
-        if adb_run(adb, serial, "exec-out", "cat", f"{Q}/{destination}") != replacement:
+        adb_shell(adb, serial, script)
+        if adb_read(adb, serial, f"{Q}/{destination}") != replacement:
             raise ValueError(
                 "Station file differs after installation; inspect before retrying"
             )
     finally:
-        adb_run(adb, serial, "shell", "rm", "-rf", stage)
+        adb_shell(adb, serial, "rm -rf " + shlex.quote(stage))
 
 
 def main():
@@ -378,13 +391,10 @@ def main():
             print("Firmware " + files["version_full"].decode().strip())
             print("ADB " + adb_state)
             print("OTA " + ota_state + " in launcher configuration")
-            markers = adb_run(
+            markers = adb_shell(
                 args.adb,
                 args.serial,
-                "shell",
-                "sh",
-                "-s",
-                content=b'for m in activate_adb_quasmodrom activate_network_adb; do if [ -f "/data/quasar/$m" ]; then echo "$m present"; else echo "$m missing"; fi; done\n',
+                'for m in activate_adb_quasmodrom activate_network_adb; do if [ -f "/data/quasar/$m" ]; then echo "$m present"; else echo "$m missing"; fi; done\n',
             )
             print(markers.decode().strip())
             return
@@ -403,20 +413,17 @@ def main():
             backup,
             args.operation == "install-adb",
         )
-        print(
-            "Applied "
-            + args.operation
-            + (
-                "; reboot to apply the launcher change"
-                if not is_adb
-                else "; activation markers retained"
-            )
-        )
+        if is_adb:
+            detail = "; activation markers retained"
+        elif replacement != files[destination]:
+            detail = "; reboot to apply the launcher change"
+        else:
+            detail = "; launcher unchanged"
+        print("Applied " + args.operation + detail)
     except (
         OSError,
         ValueError,
         TypeError,
-        tarfile.TarError,
         subprocess.SubprocessError,
     ) as error:
         parser.exit(1, f"{error}\n")
